@@ -1,0 +1,101 @@
+-- TechFix Informatica - Atividade Aula 2
+-- Execute este arquivo completo no SQL Editor do projeto Supabase.
+-- Esta versao cria a estrutura; as policies da conta tecnica serao adicionadas depois.
+-- Nao remove tabelas nem registros existentes.
+
+-- Bloco 1 - Transacao: aplicar a criacao e as permissoes em conjunto.
+begin;
+
+-- Bloco 2 - Clientes: identificador automatico e dados obrigatorios.
+-- O e-mail e armazenado em minusculas, como ja faz o modulo db.py.
+-- UNIQUE(email) permite reaproveitar o cliente no upsert do Python.
+create table if not exists public.clientes (
+    id bigint generated always as identity primary key,
+    nome text not null,
+    endereco text not null,
+    email text not null,
+    celular_whatsapp text not null,
+    data_cadastro timestamptz not null default now(),
+
+    constraint clientes_nome_preenchido
+        check (length(btrim(nome)) > 0),
+    constraint clientes_endereco_preenchido
+        check (length(btrim(endereco)) > 0),
+    constraint clientes_email_unico
+        unique (email),
+    constraint clientes_email_formato
+        check (email ~ '^[^@[:space:]]+@[^@[:space:]]+\.[^@[:space:]]+$'),
+    constraint clientes_email_normalizado
+        check (email = lower(btrim(email))),
+    constraint clientes_celular_formato
+        check (celular_whatsapp ~ '^[0-9]{10,13}$')
+);
+
+-- Bloco 3 - Ordens de servico: um cliente pode possuir varias OS.
+-- RESTRICT impede excluir um cliente enquanto houver OS vinculadas.
+-- As datas sao preenchidas na insercao. Ao editar uma OS, o Python
+-- devera atualizar data_atualizacao; o valor DEFAULT nao faz isso sozinho.
+create table if not exists public.ordens_servico (
+    id bigint generated always as identity primary key,
+    cliente_id bigint not null,
+    modelo_computador text not null,
+    problema_relatado text not null,
+    status text not null default 'Aberto',
+    data_abertura timestamptz not null default now(),
+    data_atualizacao timestamptz not null default now(),
+
+    constraint ordens_servico_cliente_fk
+        foreign key (cliente_id)
+        references public.clientes (id)
+        on delete restrict,
+    constraint ordens_servico_modelo_preenchido
+        check (length(btrim(modelo_computador)) > 0),
+    constraint ordens_servico_problema_preenchido
+        check (length(btrim(problema_relatado)) > 0),
+    constraint ordens_servico_status_valido
+        check (status in (
+            'Aberto', 'Em análise', 'Aguardando peça', 'Concluído', 'Entregue'
+        ))
+);
+
+-- Bloco 4 - Indice da chave estrangeira para consultas por cliente.
+-- As PKs e a restricao UNIQUE ja criam seus proprios indices.
+create index if not exists idx_ordens_servico_cliente_id
+    on public.ordens_servico (cliente_id);
+
+-- Bloco 5 - Habilitar Row Level Security nas duas tabelas.
+-- Sem policies, usuarios comuns nao acessam registros pela API.
+-- O SQL Editor usa um papel administrativo e pode inspecionar as tabelas.
+alter table public.clientes enable row level security;
+alter table public.ordens_servico enable row level security;
+
+-- Bloco 6 - Retirar acesso anonimo e definir os privilegios basicos
+-- para authenticated. A RLS ainda bloqueara registros ate a etapa de policies.
+revoke all on table public.clientes, public.ordens_servico
+    from anon, authenticated;
+
+grant select, insert, update, delete
+    on table public.clientes, public.ordens_servico
+    to authenticated;
+
+-- Bloco 7 - Permitir a geracao dos IDs para a conta autenticada.
+-- As sequences abaixo sao criadas automaticamente pelas colunas identity.
+revoke all on sequence public.clientes_id_seq, public.ordens_servico_id_seq
+    from anon, authenticated;
+
+grant usage on sequence public.clientes_id_seq, public.ordens_servico_id_seq
+    to authenticated;
+
+-- Bloco 8 - Confirmar as alteracoes.
+commit;
+
+-- Bloco 9 - Conferencia final: devem aparecer duas tabelas com RLS true.
+select
+    c.relname as tabela,
+    c.relrowsecurity as rls_ativo
+from pg_class as c
+join pg_namespace as n on n.oid = c.relnamespace
+where n.nspname = 'public'
+  and c.relkind = 'r'
+  and c.relname in ('clientes', 'ordens_servico')
+order by c.relname;

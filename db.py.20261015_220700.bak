@@ -1,0 +1,202 @@
+"""Conexão, validações, cadastro e atualização compartilhados pela TechFix."""
+
+import logging
+import os
+import re
+from datetime import datetime, timezone
+from functools import lru_cache
+from pathlib import Path
+
+from dotenv import load_dotenv
+from supabase import Client, create_client
+
+
+load_dotenv(Path(__file__).resolve().parent / ".env")
+LOGGER = logging.getLogger(__name__)
+
+VARIAVEIS_SUPABASE = (
+    "SUPABASE_URL",
+    "SUPABASE_KEY",
+    "SUPABASE_AUTH_EMAIL",
+    "SUPABASE_AUTH_PASSWORD",
+)
+
+STATUS_OS = ("Aberto", "Em análise", "Aguardando peça", "Concluído", "Entregue")
+
+
+class ErroTechFix(Exception):
+    """Erro com mensagem que pode ser apresentada na interface."""
+
+
+def configuracao_disponivel() -> bool:
+    """Verifica se as variáveis existem, sem autenticar ou consultar o banco."""
+    return all(os.getenv(nome, "").strip() for nome in VARIAVEIS_SUPABASE)
+
+
+@lru_cache(maxsize=1)
+def obter_conexao() -> Client:
+    """Autentica a conta técnica e reutiliza o cliente no processo Python."""
+    if not configuracao_disponivel():
+        raise ErroTechFix(
+            "A conexão com o Supabase ainda não foi configurada. "
+            "Preencha as quatro variáveis de conexão e reinicie o aplicativo."
+        )
+
+    try:
+        cliente = create_client(
+            os.environ["SUPABASE_URL"].strip(),
+            os.environ["SUPABASE_KEY"].strip(),
+        )
+        cliente.auth.sign_in_with_password(
+            {
+                "email": os.environ["SUPABASE_AUTH_EMAIL"].strip(),
+                "password": os.environ["SUPABASE_AUTH_PASSWORD"],
+            }
+        )
+        return cliente
+    except Exception as exc:
+        LOGGER.error("Falha na autenticação (%s).", type(exc).__name__)
+        raise ErroTechFix(
+            "Não foi possível conectar ao Supabase. "
+            "Confira a conexão com a internet e as credenciais da conta técnica."
+        ) from exc
+
+
+def validar_cadastro(
+    nome: str,
+    endereco: str,
+    email: str,
+    celular_whatsapp: str,
+    modelo_computador: str,
+    problema_relatado: str,
+) -> dict[str, str]:
+    """Valida os campos e devolve os valores normalizados."""
+    dados = {
+        "nome": str(nome or "").strip(),
+        "endereco": str(endereco or "").strip(),
+        "email": str(email or "").strip().lower(),
+        "celular_whatsapp": str(celular_whatsapp or "").strip(),
+        "modelo_computador": str(modelo_computador or "").strip(),
+        "problema_relatado": str(problema_relatado or "").strip(),
+    }
+
+    if not all(dados.values()):
+        raise ValueError("Preencha todos os campos obrigatórios.")
+    if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", dados["email"]):
+        raise ValueError("Informe um e-mail válido, como cliente@example.com.")
+    if not re.fullmatch(r"[0-9]{10,13}", dados["celular_whatsapp"]):
+        raise ValueError("O celular deve conter somente números, de 10 a 13 dígitos.")
+
+    return dados
+
+
+def cadastrar_ordem(
+    nome: str,
+    endereco: str,
+    email: str,
+    celular_whatsapp: str,
+    modelo_computador: str,
+    problema_relatado: str,
+) -> int:
+    """Reaproveita o cliente pelo e-mail e abre uma nova OS com status Aberto."""
+    dados = validar_cadastro(
+        nome, endereco, email, celular_whatsapp, modelo_computador, problema_relatado
+    )
+    cliente = obter_conexao()
+    dados_cliente = {campo: dados[campo] for campo in (
+        "nome", "endereco", "email", "celular_whatsapp"
+    )}
+
+    try:
+        # ON CONFLICT DO NOTHING: um e-mail existente não terá seus dados alterados.
+        cliente.table("clientes").upsert(
+            dados_cliente, on_conflict="email", ignore_duplicates=True
+        ).execute()
+
+        resposta = (
+            cliente.table("clientes")
+            .select("id")
+            .eq("email", dados["email"])
+            .limit(1)
+            .execute()
+        )
+        if not resposta.data:
+            raise ErroTechFix(
+                "Não foi possível localizar o cliente. Confira as permissões do banco."
+            )
+
+        resposta_os = cliente.table("ordens_servico").insert({
+            "cliente_id": resposta.data[0]["id"],
+            "modelo_computador": dados["modelo_computador"],
+            "problema_relatado": dados["problema_relatado"],
+            "status": "Aberto",
+        }).execute()
+        if not resposta_os.data:
+            raise ErroTechFix("O banco não retornou o número da OS. Confira os registros.")
+
+        return int(resposta_os.data[0]["id"])
+    except ErroTechFix:
+        raise
+    except Exception as exc:
+        LOGGER.error("Falha no cadastro de OS (%s).", type(exc).__name__)
+        raise ErroTechFix(
+            "Não foi possível cadastrar a OS. "
+            "Confira a conexão, as tabelas e as permissões do Supabase."
+        ) from exc
+
+
+def atualizar_ordem(
+    numero_os: int,
+    *,
+    status: str | None = None,
+    modelo_computador: str | None = None,
+    problema_relatado: str | None = None,
+) -> dict:
+    """Edita uma OS e envia data_atualizacao no mesmo UPDATE.
+
+    Campos não informados são preservados. As telas de edição devem usar
+    esta função para manter a data de atualização sob responsabilidade do Python.
+    """
+    if isinstance(numero_os, bool) or not isinstance(numero_os, int) or numero_os < 1:
+        raise ValueError("Informe um número de OS inteiro e positivo.")
+
+    alteracoes = {
+        "status": status,
+        "modelo_computador": modelo_computador,
+        "problema_relatado": problema_relatado,
+    }
+    dados = {
+        campo: str(valor).strip()
+        for campo, valor in alteracoes.items()
+        if valor is not None
+    }
+    if not dados:
+        raise ValueError("Informe pelo menos um campo para alterar.")
+    if not all(dados.values()):
+        raise ValueError("Os campos alterados não podem ficar vazios.")
+    if "status" in dados and dados["status"] not in STATUS_OS:
+        raise ValueError("Selecione um dos cinco status permitidos para a OS.")
+
+    cliente = obter_conexao()
+    # Data em UTC com fuso explícito, compatível com timestamptz no PostgreSQL.
+    dados["data_atualizacao"] = datetime.now(timezone.utc).isoformat()
+
+    try:
+        resposta = (
+            cliente.table("ordens_servico")
+            .update(dados)
+            .eq("id", numero_os)
+            .select("id,status,modelo_computador,problema_relatado,data_atualizacao")
+            .execute()
+        )
+        if not resposta.data:
+            raise ErroTechFix("OS não encontrada ou sem permissão para edição.")
+        return resposta.data[0]
+    except ErroTechFix:
+        raise
+    except Exception as exc:
+        LOGGER.error("Falha na atualização de OS (%s).", type(exc).__name__)
+        raise ErroTechFix(
+            "Não foi possível atualizar a OS. "
+            "Confira a conexão e as permissões do Supabase."
+        ) from exc
